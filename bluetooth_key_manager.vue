@@ -423,22 +423,20 @@ export default {
       // 移除空格，转换为大写
       const cleanHex = hexData.replace(/\s/g, '').toUpperCase();
       
-      // 检查是否包含固定前缀 74687864... (去掉空格后的形式)
+      // 检查数据长度是否足够（至少需要13个字节，即26个字符）
+      if (cleanHex.length < 26) return;
+      
+      // 检查是否包含固定前缀 74687864... (前12个字节，24个字符)
       const fixedPrefix = '746878647A56312E302E303030';
       
-      if (cleanHex.includes(fixedPrefix)) {
-        // 查找前缀位置
-        const prefixIndex = cleanHex.indexOf(fixedPrefix);
-        if (prefixIndex !== -1) {
-          // 获取命令类型（前缀后的第1个字节）
-          const commandTypeStart = prefixIndex + fixedPrefix.length;
-          const commandType = cleanHex.substr(commandTypeStart, 2);
-          
-          console.log('识别到命令类型:', commandType);
-          
-          // 根据命令类型解析数据
-          this.parseCommandData(commandType, cleanHex, commandTypeStart);
-        }
+      if (cleanHex.startsWith(fixedPrefix)) {
+        // 命令类型位于第13个字节位置（索引24-25）
+        const commandType = cleanHex.substr(24, 2);
+        
+        console.log('识别到命令类型:', commandType);
+        
+        // 根据命令类型解析数据
+        this.parseCommandData(commandType, cleanHex, 24);
       }
     },
 
@@ -469,11 +467,11 @@ export default {
     // 解析钥匙注册状态 (34命令)
     parseKeyRegistrationStatus(hexData, commandStart, commandName) {
       try {
-        // 34命令响应格式: 前缀 + 34 + 00 + 数据长度 + 数据内容
-        // 跳过命令类型(34) + 状态(00) + 数据长度字段，找到实际数据
-        const dataStart = commandStart + 2 + 2 + 8; // 命令(2) + 状态(2) + 长度(8)
+        // 34命令响应格式: 固定前缀(12字节) + 命令类型(1字节) + 状态码(1字节) + 数据长度(4字节) + 实际数据
+        // 跳过前缀(24) + 命令类型(2) + 状态码(2) + 数据长度(8) = 36字符后是实际数据
+        const dataStart = 24 + 2 + 2 + 8; // 前缀(24) + 命令(2) + 状态(2) + 长度(8)
         
-        if (hexData.length >= dataStart + 10) { // 至少需要5个字节的数据
+        if (hexData.length >= dataStart + 10) { // 至少需要5个字节的数据(10个字符)
           // 获取注册状态 (第1个字节)
           const regStatusHex = hexData.substr(dataStart, 2);
           const regStatus = parseInt(regStatusHex, 16);
@@ -493,12 +491,22 @@ export default {
             commandName: commandName,
             data: [
               { label: '注册状态', value: `${regStatusText} (${regStatusHex})` },
-              { label: 'Key编码(16进制)', value: keyCodeHex },
-              { label: 'Key编码(10进制)', value: keyCodeDecimal }
+              { label: 'Key编码(16进制)', value: keyCodeHex.toUpperCase() },
+              { label: 'Key编码(10进制)', value: keyCodeDecimal },
+              { label: '原始数据位置', value: `起始位置: ${dataStart}, 数据: ${hexData.substr(dataStart, 10)}` }
             ]
           };
           
           console.log('解析钥匙注册状态:', this.parsedResult);
+        } else {
+          this.parsedResult = {
+            commandName: commandName,
+            data: [
+              { label: '解析状态', value: '数据长度不足' },
+              { label: '数据长度', value: hexData.length },
+              { label: '需要长度', value: dataStart + 10 }
+            ]
+          };
         }
       } catch (error) {
         console.error('解析钥匙注册状态失败:', error);
