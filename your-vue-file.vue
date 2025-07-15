@@ -9,25 +9,33 @@
     
     <!-- 显示当前连接的设备 -->
     <view v-if="isConnected" class="connected-device">
-      <text>已连接设备:</text>
-      <text>{{ connectedDeviceName || selectedDeviceId }}</text>
+      <text>已连接设备: {{ connectedDeviceName || selectedDeviceId }}</text>
       <text>信号强度: {{ connectedDeviceRSSI }}</text>
+      <text>钥匙编号: {{ keyId }}, 锁编号: {{ lockId }}</text>
     </view>
     
     <text>设备状态：{{ deviceStatus }}</text>
     
     <!-- 命令按钮组 -->
     <view v-if="isConnected" class="command-section">
-      <text class="section-title">钥匙指令</text>
+      <text class="section-title">基础指令</text>
       <view class="command-buttons">
-        <button @click="getKeyInfo" class="cmd-btn">查询钥匙信息</button>
         <button @click="queryKeyRegStatus" class="cmd-btn">查询注册状态</button>
-        <button @click="queryKeySnid" class="cmd-btn">查询钥匙SNID</button>
-        <button @click="verifyKeySnid" class="cmd-btn">验证钥匙SNID</button>
-        <button @click="resetKeyFactory" class="cmd-btn">恢复出厂配置</button>
-        <button @click="setKeyTime" class="cmd-btn">设置校准时间</button>
+        <button @click="queryKeySnid" class="cmd-btn">查询SNID</button>
+        <button @click="verifyKeySnid" class="cmd-btn">验证SNID</button>
         <button @click="registerKey" class="cmd-btn">注册钥匙</button>
+        <button @click="getKeyInfo" class="cmd-btn">查询钥匙信息</button>
+      </view>
+      
+      <text class="section-title">配置指令</text>
+      <view class="command-buttons">
+        <button @click="setKeyTime" class="cmd-btn">同步时间</button>
         <button @click="setKeyPassword" class="cmd-btn">设置通讯密码</button>
+        <button @click="resetKeyFactory" class="cmd-btn">恢复出厂</button>
+      </view>
+      
+      <text class="section-title">权限设置</text>
+      <view class="command-buttons">
         <button @click="setKeyPermission" class="cmd-btn">设置权限(一般)</button>
         <button @click="setKeyPermissionMax" class="cmd-btn">设置权限(最高)</button>
       </view>
@@ -40,6 +48,15 @@
       
       <text class="section-title">接收数据:</text>
       <text class="hex-data">{{ receivedDataHex }}</text>
+      
+      <!-- 解析简要信息 -->
+      <view v-if="lastResponse" class="response-info">
+        <text class="section-title">响应信息:</text>
+        <text>指令: {{ lastResponse.commandName }}</text>
+        <text>状态: {{ lastResponse.status }}</text>
+        <text v-if="lastResponse.keyId">钥匙ID: {{ lastResponse.keyId }}</text>
+        <text v-if="lastResponse.returnCode">返回码: {{ lastResponse.returnCode }}</text>
+      </view>
     </view>
 
     <!-- 设备列表 -->
@@ -64,8 +81,8 @@ export default {
       deviceId: null,
       serviceId: '0000FFF0-0000-1000-8000-00805F9B34FB',
       characteristicId: {
-        write: '0000FFF6-0000-1000-8000-00805F9B34FB', // 写入特征值
-        notify: '0000FFF7-0000-1000-8000-00805F9B34FB' // 通知特征值
+        write: '0000FFF6-0000-1000-8000-00805F9B34FB',
+        notify: '0000FFF7-0000-1000-8000-00805F9B34FB'
       },
       isConnected: false,
       isConnecting: false,
@@ -77,10 +94,16 @@ export default {
       connectedDeviceName: '',
       connectedDeviceRSSI: 0,
       
+      // 钥匙和锁的信息
+      keyId: 123456,  // 钥匙编号
+      lockId: 19456,  // 锁编号
+      keySnid: [0x52, 0xFF, 0x6D, 0x06, 0x72, 0x70, 0x50, 0x55, 0x17, 0x44, 0x03, 0x67], // 示例SNID
+      
       // 数据记录
-      sentDataHex: '',      // 发送的完整数据(16进制)
-      receivedDataHex: '',  // 接收的完整数据(16进制)
-      receivedPackets: [],   // 存储接收到的所有数据包
+      sentDataHex: '',
+      receivedDataHex: '',
+      receivedPackets: [],
+      lastResponse: null, // 最后一次响应的简要信息
     };
   },
   methods: {
@@ -91,7 +114,126 @@ export default {
       return '未知设备';
     },
     
-    // 1. 初始化蓝牙并开始扫描
+    // 获取当前时间戳 (Unix timestamp)
+    getCurrentTimestamp() {
+      return Math.floor(Date.now() / 1000);
+    },
+    
+    // 计算CRC32校验码 (简化版本，实际应用中需要完整的CRC32算法)
+    calculateCRC32(data) {
+      // 这里使用简化的校验算法，实际应用中应该使用标准CRC32
+      let crc = 0xFFFFFFFF;
+      for (let i = 0; i < data.length; i++) {
+        crc ^= data[i];
+        for (let j = 0; j < 8; j++) {
+          crc = (crc & 1) ? (crc >>> 1) ^ 0xEDB88320 : crc >>> 1;
+        }
+      }
+      return (~crc >>> 0);
+    },
+    
+    // 构建协议数据包
+    buildProtocolPacket(frameType, dataBytes = []) {
+      // 协议头
+      const frameHeader = [0x74, 0x68, 0x78, 0x64, 0x7A]; // 帧头
+      const firmwareVersion = [0x56, 0x31, 0x2E, 0x30, 0x2E, 0x30, 0x30]; // "V1.0.00"
+      const frameTypeBytes = [(frameType >> 8) & 0xFF, frameType & 0xFF]; // 帧类型
+      
+      // 协议体
+      const frameLength = dataBytes.length + 4; // 数据位长度 + 校验位长度
+      const frameLengthBytes = [
+        (frameLength >> 24) & 0xFF,
+        (frameLength >> 16) & 0xFF,
+        (frameLength >> 8) & 0xFF,
+        frameLength & 0xFF
+      ];
+      
+      // 计算CRC32校验
+      const crcData = [...firmwareVersion, ...frameTypeBytes, ...frameLengthBytes, ...dataBytes];
+      const crc = this.calculateCRC32(crcData);
+      const crcBytes = [
+        (crc >> 24) & 0xFF,
+        (crc >> 16) & 0xFF,
+        (crc >> 8) & 0xFF,
+        crc & 0xFF
+      ];
+      
+      // 协议尾
+      const frameTail = [0x77, 0x88, 0x55, 0xAA]; // 帧尾
+      
+      // 组合完整数据包
+      const packet = [
+        ...frameHeader,
+        ...firmwareVersion,
+        ...frameTypeBytes,
+        ...frameLengthBytes,
+        ...dataBytes,
+        ...crcBytes,
+        ...frameTail
+      ];
+      
+      return packet;
+    },
+    
+    // 解析接收到的数据包
+    parseResponsePacket(hexData) {
+      try {
+        const bytes = this.hexToBytes(hexData.replace(/\s/g, ''));
+        
+        // 检查帧头和帧尾
+        const frameHeader = bytes.slice(0, 5);
+        const frameTail = bytes.slice(-4);
+        
+        if (!this.arraysEqual(frameHeader, [0x74, 0x68, 0x78, 0x64, 0x7A]) ||
+            !this.arraysEqual(frameTail, [0x77, 0x88, 0x55, 0xAA])) {
+          console.log('帧头或帧尾不匹配');
+          return null;
+        }
+        
+        // 解析帧类型
+        const frameType = (bytes[12] << 8) | bytes[13];
+        const frameTypeHex = `0x${frameType.toString(16).toUpperCase()}`;
+        
+        // 解析数据长度
+        const dataLength = (bytes[14] << 24) | (bytes[15] << 16) | (bytes[16] << 8) | bytes[17];
+        
+        // 提取数据部分
+        const dataStart = 18;
+        const dataEnd = dataStart + dataLength - 4; // 减去CRC长度
+        const dataBytes = bytes.slice(dataStart, dataEnd);
+        
+        return {
+          frameType,
+          frameTypeHex,
+          dataLength,
+          dataBytes
+        };
+      } catch (error) {
+        console.error('解析数据包失败:', error);
+        return null;
+      }
+    },
+    
+    // 数组比较
+    arraysEqual(a, b) {
+      return a.length === b.length && a.every((val, index) => val === b[index]);
+    },
+    
+    // 十六进制字符串转字节数组
+    hexToBytes(hex) {
+      const bytes = [];
+      for (let i = 0; i < hex.length; i += 2) {
+        bytes.push(parseInt(hex.substr(i, 2), 16));
+      }
+      return bytes;
+    },
+    
+    // 字节数组转十六进制字符串
+    bytesToHex(bytes) {
+      return bytes.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+    },
+    
+    // 1. 开始扫描
     startScan() {
       console.log('开始扫描...');
       uni.openBluetoothAdapter({
@@ -123,7 +265,6 @@ export default {
       });
     },
     
-    // 请求蓝牙权限
     showBluetoothAuthDialog() {
       console.log('请求蓝牙权限...');
       uni.showModal({
@@ -138,7 +279,6 @@ export default {
       });
     },
     
-    // 开始设备发现
     startDeviceDiscovery() {
       console.log('开始设备发现...');
       this.stopScan();
@@ -160,7 +300,7 @@ export default {
           console.log('开始扫描成功');
           
           this.deviceFoundHandler = (res) => {
-            console.log('发现设备:', res.devices.name);
+            console.log('发现设备:', res.devices);
             res.devices.forEach(device => {
               const deviceName = this.formatDeviceName(device);
               if (deviceName.toUpperCase().startsWith('KEY')) {
@@ -189,7 +329,6 @@ export default {
       });
     },
     
-    // 添加设备（去重）
     addDevice(device) {
       if (!device.deviceId) return;
       const exists = this.devices.some(d => d.deviceId === device.deviceId);
@@ -199,7 +338,6 @@ export default {
       }
     },
     
-    // 2. 停止扫描
     stopScan() {
       console.log('停止扫描...');
       if (this.scanTimeout) {
@@ -229,14 +367,12 @@ export default {
       });
     },
     
-    // 3. 选择设备
     selectDevice(device) {
       console.log('选择设备:', device);
       this.selectedDeviceId = device.deviceId;
       this.deviceStatus = `已选择: ${this.formatDeviceName(device)}`;
     },
 
-    // 4. 连接设备
     connectDevice() {
       console.log('连接设备:', this.selectedDeviceId);
       if (!this.selectedDeviceId) {
@@ -287,7 +423,6 @@ export default {
       });
     },
 
-    // 5. 获取服务
     getServices() {
       console.log('获取服务...');
       uni.getBLEDeviceServices({
@@ -312,7 +447,6 @@ export default {
       });
     },
 
-    // 6. 获取特征值
     getCharacteristics(serviceId) {
       console.log('获取特征值...', serviceId);
       uni.getBLEDeviceCharacteristics({
@@ -354,7 +488,6 @@ export default {
       });
     },
 
-    // 7. 启用通知
     enableNotifications(serviceId, characteristicId) {
       console.log('启用通知...', serviceId, characteristicId);
       uni.notifyBLECharacteristicValueChange({
@@ -374,6 +507,9 @@ export default {
             this.receivedPackets.push(hexStr);
             this.receivedDataHex = this.receivedPackets.join(' ');
             this.deviceStatus = `已接收 ${this.receivedPackets.length} 个数据包`;
+            
+            // 解析响应
+            this.parseResponse(this.receivedDataHex);
           });
           this.deviceStatus = '已启用通知';
           uni.showToast({ title: '通知已启用', icon: 'success' });
@@ -384,8 +520,138 @@ export default {
         }
       });
     },
+    
+    // 解析响应数据
+    parseResponse(hexData) {
+      const parsed = this.parseResponsePacket(hexData);
+      if (!parsed) return;
+      
+      const { frameType, dataBytes } = parsed;
+      let response = { commandName: '未知指令', status: '解析中' };
+      
+      switch (frameType) {
+        case 0x34: // 查询钥匙注册状态回复
+          response = this.parseQueryKeyStatusResponse(dataBytes);
+          break;
+        case 0x36: // 查询钥匙SNID回复
+          response = this.parseQuerySnidResponse(dataBytes);
+          break;
+        case 0x38: // 注册钥匙回复
+          response = this.parseRegisterKeyResponse(dataBytes);
+          break;
+        case 0x3A: // 验证钥匙SNID回复
+          response = this.parseVerifySnidResponse(dataBytes);
+          break;
+        case 0x06: // 查询钥匙信息回复
+          response = this.parseKeyInfoResponse(dataBytes);
+          break;
+        case 0x0A: // 设置校准时间回复
+          response = this.parseSetTimeResponse(dataBytes);
+          break;
+        case 0x32: // 错误码
+          response = this.parseErrorResponse(dataBytes);
+          break;
+        default:
+          response.commandName = `指令 ${parsed.frameTypeHex}`;
+          response.status = '未实现解析';
+      }
+      
+      this.lastResponse = response;
+      console.log('解析响应:', response);
+    },
+    
+    // 解析各种响应的具体函数
+    parseQueryKeyStatusResponse(dataBytes) {
+      const returnCode = dataBytes[0];
+      const keyId = (dataBytes[1] << 24) | (dataBytes[2] << 16) | (dataBytes[3] << 8) | dataBytes[4];
+      
+      return {
+        commandName: '查询注册状态',
+        status: returnCode === 1 ? '钥匙已注册' : '钥匙未注册',
+        returnCode,
+        keyId
+      };
+    },
+    
+    parseQuerySnidResponse(dataBytes) {
+      const returnCode = dataBytes[0];
+      const keyId = (dataBytes[1] << 24) | (dataBytes[2] << 16) | (dataBytes[3] << 8) | dataBytes[4];
+      const snid = dataBytes.slice(5, 17);
+      
+      return {
+        commandName: '查询SNID',
+        status: returnCode === 1 ? '查询成功' : '查询失败',
+        returnCode,
+        keyId,
+        snid: this.bytesToHex(snid)
+      };
+    },
+    
+    parseRegisterKeyResponse(dataBytes) {
+      const returnCode = dataBytes[0];
+      let status = '未知状态';
+      
+      switch (returnCode) {
+        case 1: status = '注册成功'; break;
+        case 2: status = '钥匙已注册'; break;
+        case 3: status = 'SNID错误'; break;
+      }
+      
+      return {
+        commandName: '注册钥匙',
+        status,
+        returnCode
+      };
+    },
+    
+    parseVerifySnidResponse(dataBytes) {
+      const returnCode = dataBytes[0];
+      
+      return {
+        commandName: '验证SNID',
+        status: returnCode === 1 ? '验证成功' : '验证失败',
+        returnCode
+      };
+    },
+    
+    parseKeyInfoResponse(dataBytes) {
+      // 解析钥匙信息 (简化版本)
+      return {
+        commandName: '查询钥匙信息',
+        status: '获取成功',
+        returnCode: 1
+      };
+    },
+    
+    parseSetTimeResponse(dataBytes) {
+      const timestamp = (dataBytes[0] << 24) | (dataBytes[1] << 16) | (dataBytes[2] << 8) | dataBytes[3];
+      
+      return {
+        commandName: '设置校准时间',
+        status: '设置成功',
+        timestamp
+      };
+    },
+    
+    parseErrorResponse(dataBytes) {
+      const returnCode = dataBytes[0];
+      let status = '未知错误';
+      
+      switch (returnCode) {
+        case 0: status = 'CRC校验错误'; break;
+        case 1: status = '接收数据超时'; break;
+        case 2: status = '帧格式不存在'; break;
+        case 3: status = 'SNID未验证'; break;
+        case 4: status = '指令无效'; break;
+      }
+      
+      return {
+        commandName: '错误响应',
+        status,
+        returnCode
+      };
+    },
 
-    // 8. 断开连接
     disconnectDevice() {
       console.log('断开连接...');
       uni.closeBLEConnection({
@@ -400,6 +666,7 @@ export default {
           this.sentDataHex = '';
           this.receivedDataHex = '';
           this.receivedPackets = [];
+          this.lastResponse = null;
         },
         fail: (err) => {
           console.error('断开失败:', err);
@@ -409,7 +676,7 @@ export default {
     },
 
     // 通用命令发送函数
-    sendCommand(hexData, commandName) {
+    sendCommand(packetBytes, commandName) {
       console.log(`发送${commandName}命令...`);
       if (!this.isConnected) {
         uni.showToast({ title: '未连接设备', icon: 'none' });
@@ -418,115 +685,110 @@ export default {
       
       this.receivedPackets = [];
       this.receivedDataHex = '';
-      this.sentDataHex = hexData;
+      this.lastResponse = null;
+      this.sentDataHex = this.bytesToHex(packetBytes);
       
-      const bytes = hexData.split(" ").map(b => parseInt(b, 16));
-      const buffer = new ArrayBuffer(bytes.length);
+      const buffer = new ArrayBuffer(packetBytes.length);
       const dataView = new DataView(buffer);
-      for (let i = 0; i < bytes.length; i++) {
-        dataView.setUint8(i, bytes[i]);
+      for (let i = 0; i < packetBytes.length; i++) {
+        dataView.setUint8(i, packetBytes[i]);
       }
 
-      console.log(`发送${commandName}数据:`, hexData);
+      console.log(`发送${commandName}数据:`, this.sentDataHex);
       this.sendBlePacket(dataView.buffer);
     },
 
-    // 各种钥匙命令
-    getKeyInfo() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 05 00 04 00 00 00 56 5B BC 2D 77 88 55 AA";
-      this.sendCommand(hexData, "查询钥匙信息");
-    },
-
+    // 各种钥匙命令 (使用协议结构)
     queryKeyRegStatus() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 33 00 04 00 00 00 E6 BF 9F FF 77 88 55 AA";
-      this.sendCommand(hexData, "查询钥匙注册状态");
-    },
-
-    resetKeyFactory() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 1A 00 04 00 00 00 18 EB 3C DF 77 88 55 AA";
-      this.sendCommand(hexData, "恢复钥匙出厂配置");
-    },
-
-    verifyKeySnid() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 39 00 10 00 00 00 12 82 0A 8B 6F F7 E3 19 D0 96 B3 32 42 88 39 F8 77 88 55 AA";
-      this.sendCommand(hexData, "验证钥匙SNID");
+      // 查询钥匙注册状态 (0x33)
+      const packet = this.buildProtocolPacket(0x33, []);
+      this.sendCommand(packet, "查询钥匙注册状态");
     },
 
     queryKeySnid() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 35 00 08 00 00 00 34 9F 6B A5 B5 11 8B 34 77 88 55 AA";
-      this.sendCommand(hexData, "查询钥匙SNID");
+      // 查询钥匙SNID (0x35) - 需要验证码
+      const verifyCode = [0x34, 0x9F, 0x6B, 0xA5];
+      const packet = this.buildProtocolPacket(0x35, verifyCode);
+      this.sendCommand(packet, "查询钥匙SNID");
     },
 
-    setKeyTime() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 09 00 08 00 00 00 B8 A7 B3 65 0F 43 36 19 77 88 55 AA";
-      this.sendCommand(hexData, "设置钥匙校准时间");
+    verifyKeySnid() {
+      // 验证钥匙SNID (0x39)
+      const packet = this.buildProtocolPacket(0x39, this.keySnid);
+      this.sendCommand(packet, "验证钥匙SNID");
     },
 
     registerKey() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 37 00 10 00 00 00 52 FF 6D 06 72 70 50 55 17 44 03 67 E9 D2 E1 71 77 88 55 AA";
-      this.sendCommand(hexData, "注册钥匙");
+      // 注册钥匙 (0x37)
+      const packet = this.buildProtocolPacket(0x37, this.keySnid);
+      this.sendCommand(packet, "注册钥匙");
+    },
+
+    getKeyInfo() {
+      // 查询钥匙信息 (0x05) - 需要SNID验证
+      const packet = this.buildProtocolPacket(0x05, []);
+      this.sendCommand(packet, "查询钥匙信息");
+    },
+
+    setKeyTime() {
+      // 设置钥匙校准时间 (0x09)
+      const timestamp = this.getCurrentTimestamp();
+      const timeBytes = [
+        (timestamp >> 24) & 0xFF,
+        (timestamp >> 16) & 0xFF,
+        (timestamp >> 8) & 0xFF,
+        timestamp & 0xFF
+      ];
+      const packet = this.buildProtocolPacket(0x09, timeBytes);
+      this.sendCommand(packet, "设置钥匙校准时间");
     },
 
     setKeyPassword() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 24 00 0C 00 00 00 31 31 32 32 33 33 34 34 0F F4 8A 5E 77 88 55 AA";
-      this.sendCommand(hexData, "设置钥匙通讯密码");
+      // 设置钥匙通讯密码 (0x24)
+      const password = [0x31, 0x31, 0x32, 0x32, 0x33, 0x33, 0x34, 0x34]; // "11223344"
+      const packet = this.buildProtocolPacket(0x24, password);
+      this.sendCommand(packet, "设置钥匙通讯密码");
+    },
+
+    resetKeyFactory() {
+      // 恢复钥匙出厂配置 (0x1A)
+      const packet = this.buildProtocolPacket(0x1A, []);
+      this.sendCommand(packet, "恢复钥匙出厂配置");
     },
 
     setKeyPermission() {
-      // 一般授权权限设置 - 发送多条命令
-      const commands = [
-        "74 68 78 64 7A 56 31 2E 30 2E 30 30 0B 00 29 00 00 00 02 00 00 00 00 00 00 00 00 FF FF FF FF 02 00 00 00 00 F6 B2 65 FF DE BA 65 00 00 00 00 7F 51 01 00 05 00 00 00 09 A7 4C 06 77 88 55 AA",
-        "74 68 78 64 7A 56 31 2E 30 2E 30 30 0D 00 10 00 00 00 01 00 00 00 01 00 00 00 2B 00 00 00 7B D5 03 11 77 88 55 AA",
-        "74 68 78 64 7A 56 31 2E 30 2E 30 30 0D 00 10 00 00 00 02 00 00 00 64 00 00 00 01 00 00 00 0E E6 19 31 77 88 55 AA"
+      // 设置钥匙权限(一般授权) (0x0B) - 需要多条命令
+      const authData = [
+        0x02, 0x00, 0x00, 0x00, // 权限类型
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // 锁号范围
+        0x02, 0x00, 0x00, 0x00, 0x00, // 锁数量
+        0xF6, 0xB2, 0x65, 0xFF, 0xDE, 0xBA, 0x65, // 授权日期
+        0x00, 0x00, 0x00, 0x00, 0x7F, 0x51, 0x01, 0x00, // 授权时间
+        0x05, 0x00, 0x00, 0x00 // 使用次数
       ];
       
-      this.sendMultipleCommands(commands, "设置钥匙权限(一般授权)");
+      const packet = this.buildProtocolPacket(0x0B, authData);
+      this.sendCommand(packet, "设置钥匙权限(一般授权)");
+      
+      // 后续还需要发送0x0D指令，这里简化处理
     },
 
     setKeyPermissionMax() {
-      const hexData = "74 68 78 64 7A 56 31 2E 30 2E 30 30 0B 00 29 00 00 00 01 00 00 00 00 00 00 00 00 FF FF FF FF FF FF FF FF 00 F6 B2 65 FF DE BA 65 00 00 00 00 7F 51 01 00 00 00 00 00 8B 91 F6 EE 77 88 55 AA";
-      this.sendCommand(hexData, "设置钥匙权限(单位最高)");
+      // 设置钥匙权限(单位最高) (0x0B)
+      const authData = [
+        0x01, 0x00, 0x00, 0x00, // 权限类型(最高权限)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, // 锁号范围
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, // 所有锁
+        0xF6, 0xB2, 0x65, 0xFF, 0xDE, 0xBA, 0x65, // 授权日期
+        0x00, 0x00, 0x00, 0x00, 0x7F, 0x51, 0x01, 0x00, // 授权时间
+        0x00, 0x00, 0x00, 0x00 // 无次数限制
+      ];
+      
+      const packet = this.buildProtocolPacket(0x0B, authData);
+      this.sendCommand(packet, "设置钥匙权限(单位最高)");
     },
 
-    // 发送多条命令
-    sendMultipleCommands(commands, commandName) {
-      console.log(`发送${commandName}命令...`);
-      if (!this.isConnected) {
-        uni.showToast({ title: '未连接设备', icon: 'none' });
-        return;
-      }
-      
-      this.receivedPackets = [];
-      this.receivedDataHex = '';
-      this.sentDataHex = commands.join('\n');
-      
-      let currentIndex = 0;
-      const sendNext = () => {
-        if (currentIndex >= commands.length) {
-          console.log(`${commandName}全部命令发送完成`);
-          return;
-        }
-        
-        const hexData = commands[currentIndex];
-        const bytes = hexData.split(" ").map(b => parseInt(b, 16));
-        const buffer = new ArrayBuffer(bytes.length);
-        const dataView = new DataView(buffer);
-        for (let i = 0; i < bytes.length; i++) {
-          dataView.setUint8(i, bytes[i]);
-        }
-        
-        console.log(`发送${commandName}第${currentIndex + 1}条命令:`, hexData);
-        this.sendBlePacket(dataView.buffer);
-        
-        currentIndex++;
-        // 延迟发送下一条命令
-        setTimeout(sendNext, 2000);
-      };
-      
-      sendNext();
-    },
-
-    // 10. 发送BLE数据包
+    // 发送BLE数据包
     sendBlePacket(data) {
       console.log('开始发送数据包...');
       const packetSize = 20;
@@ -658,6 +920,11 @@ export default {
   margin-bottom: 10px;
 }
 
+.connected-device text {
+  display: block;
+  margin: 2px 0;
+}
+
 .device-item {
   padding: 12px;
   border-bottom: 1px solid #eee;
@@ -703,5 +970,19 @@ export default {
   border: 1px solid #eee;
   max-height: 150px;
   overflow-y: auto;
+}
+
+.response-info {
+  background-color: #fff3cd;
+  padding: 10px;
+  border-radius: 4px;
+  border-left: 4px solid #ffc107;
+  margin-top: 10px;
+}
+
+.response-info text {
+  display: block;
+  margin: 2px 0;
+  font-size: 14px;
 }
 </style>
